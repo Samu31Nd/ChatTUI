@@ -18,7 +18,7 @@ func main() {
 	//and receive messages in communication
 	channelCommunicationServer := make(chan protocol.MessageCommunication)
 	//PORT
-	go processCommunication(channelCommunicationClient, channelCommunicationServer)
+	go processCommunication(username, channelCommunicationClient, channelCommunicationServer)
 	//APP
 	ChatroomTUI.StartChatSession(username, channelCommunicationServer, channelCommunicationClient)
 }
