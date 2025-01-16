@@ -38,7 +38,7 @@ const (
 )
 
 type listUpdate struct {
-	users []string
+	users []list.Item
 }
 
 type messageStruct struct {
@@ -48,6 +48,12 @@ type messageStruct struct {
 
 type ErrorMsg struct {
 	msg error
+}
+
+type privateMessage struct {
+	orgn    string
+	dest    string
+	message string
 }
 
 type fileStruct struct {
@@ -63,9 +69,11 @@ var (
 )
 
 type ChatModel struct {
+	targetMsg       string
 	textarea        textarea.Model
 	viewportChat    viewport.Model
-	viewportUsers   viewport.Model
+	viewportUsers   list.Model
+	users           []list.Item
 	viewportFiles   list.Model
 	messages        []string
 	files           []list.Item
@@ -92,25 +100,32 @@ func InitChat(username string, send chan<- protocol.MessageCommunication, rec <-
 	vpc := viewport.New(30, 5)
 	vpc.SetContent(`Welcome to the chat room!
 Type a message and press Enter to send.`)
+	users := make([]list.Item, 0)
+	lu := list.New(users, userDelegate{}, 100, 10)
+	lu.SetShowHelp(false)
+	lu.Title = "Users"
+	lu.DisableQuitKeybindings()
+
 	vpu := viewport.New(30, 5)
 	vpu.SetContent(
 		styles.SenderStyle.Render("Loading..."))
 
 	files := make([]list.Item, 0)
-	lf := list.New(files, itemDelegate{}, 100, 10)
+	lf := list.New(files, fileDelegate{}, 100, 10)
 	lf.SetShowHelp(false)
 	lf.Title = "Files"
 	lf.DisableQuitKeybindings()
 
 	return ChatModel{
+		targetMsg:       "",
 		textarea:        ta,
 		viewportChat:    vpc,
-		viewportUsers:   vpu,
+		viewportUsers:   lu,
 		viewportFiles:   lf,
 		messages:        []string{},
 		files:           files,
 		username:        username,
-		openedViewports: _onlyChat,
+		openedViewports: _chatAndUsers,
 		focusedViewport: fvViewChat,
 		send:            send,
 		receive:         rec,
@@ -155,14 +170,27 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	switch msg := msg.(type) {
 	case listUpdate:
-		userListContent := userListTitle + "\n"
-		for _, user := range msg.users {
-			userListContent += " " + user + "\n"
-		}
-		m.viewportUsers.SetContent(userListContent)
-		return m, tea.Batch(waitForActivity(m.receive))
+		m.viewportUsers.SetItems(msg.users)
+		return m, tea.Batch(waitForActivity(m.receive), viewPortUsersCmd)
 	case messageStruct:
-		m.messages = append(m.messages, styles.SenderStyle.Render(msg.user+": ")+msg.message)
+		var userPrinted string
+		if msg.user != m.username {
+			userPrinted = msg.user
+		} else {
+			userPrinted = msg.user + " [You]"
+		}
+		m.messages = append(m.messages, styles.SenderStyle.Render(userPrinted+": ")+msg.message)
+		m.viewportChat.SetContent(lipgloss.NewStyle().Width(m.viewportChat.Width).Render(strings.Join(m.messages, "\n")))
+		m.viewportChat.GotoBottom()
+		return m, tea.Batch(waitForActivity(m.receive))
+	case privateMessage:
+		usrDest, usrOrgn := msg.dest, msg.orgn
+		if usrOrgn == m.username {
+			usrOrgn += " [You]"
+		} else {
+			usrDest += " [You]"
+		}
+		m.messages = append(m.messages, styles.SenderStyle.Render(usrOrgn+"->"+usrDest+": ")+msg.message)
 		m.viewportChat.SetContent(lipgloss.NewStyle().Width(m.viewportChat.Width).Render(strings.Join(m.messages, "\n")))
 		m.viewportChat.GotoBottom()
 		return m, tea.Batch(waitForActivity(m.receive))
@@ -170,7 +198,7 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.messages = append(m.messages, styles.SenderStyle.Render(msg.user+": 📄 ")+msg.namefile+" "+styles.HelpStyle.Render(fmt.Sprintf("%v", humanize.Bytes(msg.size))))
 		m.viewportChat.SetContent(lipgloss.NewStyle().Width(m.viewportChat.Width).Render(strings.Join(m.messages, "\n")))
 		m.viewportChat.GotoBottom()
-		m.viewportFiles.InsertItem(0, item{
+		m.viewportFiles.InsertItem(0, file{
 			name:            msg.namefile,
 			size:            msg.size,
 			percentDownload: 0,
@@ -182,14 +210,16 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			leftPannelWidth = msg.Width / 4
 			chatWidth = 3 * msg.Width / 4
 			m.viewportFiles.SetWidth(leftPannelWidth)
+			m.viewportUsers.SetWidth(leftPannelWidth)
 			m.viewportFiles.SetHeight(msg.Height - 12*lipgloss.Height("\n") - lipgloss.Height(styles.UnactiveButtonStyle.Render("Send file")))
-			m.viewportUsers.Width = leftPannelWidth
-			m.viewportUsers.Height = msg.Height - 3*lipgloss.Height("\n")
+			m.viewportUsers.SetHeight(msg.Height - 12*lipgloss.Height("\n") - lipgloss.Height(styles.UnactiveButtonStyle.Render("Send file")))
+			//m.viewportUsers.Width = leftPannelWidth
+			//m.viewportUsers.Height = msg.Height - 3*lipgloss.Height("\n")
 		}
 
 		m.viewportChat.Width = chatWidth
 		m.textarea.SetWidth(chatWidth)
-		m.viewportChat.Height = msg.Height - m.textarea.Height() - lipgloss.Height(gap) - 2*lipgloss.Height("\n")
+		m.viewportChat.Height = msg.Height - m.textarea.Height() - lipgloss.Height(gap) - 2*lipgloss.Height("\n") - lipgloss.Height(m.targetMsg+"\n")
 		if len(m.messages) > 0 {
 			m.viewportChat.SetContent(lipgloss.NewStyle().Width(m.viewportChat.Width).Render(strings.Join(m.messages, "\n")))
 		}
@@ -236,11 +266,23 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case tea.KeyEnter:
 			switch m.focusedViewport {
 			case fvViewChat:
-				go m.sendMessage(m.textarea.Value())
-				m.messages = append(m.messages, styles.SenderStyle.Render(m.username+" [You]: ")+m.textarea.Value())
-				m.viewportChat.SetContent(lipgloss.NewStyle().Width(m.viewportChat.Width).Render(strings.Join(m.messages, "\n")))
-				m.textarea.Reset()
-				m.viewportChat.GotoBottom()
+				if m.textarea.Value() != "" {
+					if m.targetMsg == "" {
+						go m.sendMessage(m.textarea.Value())
+					} else {
+						go m.sendPrivateMessage(m.textarea.Value(), m.targetMsg)
+					}
+					m.textarea.Reset()
+				}
+			case fvViewUsers:
+				actualUsers, index := m.viewportUsers.Items(), m.viewportUsers.Index()
+				var userSending string
+				actualUsers[index], userSending = toggleSelected(actualUsers[index], m.username)
+				m.viewportUsers.SetItems(actualUsers)
+
+				m.targetMsg = userSending
+				m.focusedViewport = fvViewChat
+				m.textarea.Focus()
 			default:
 			}
 		}
@@ -249,6 +291,21 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 	}
 	return m, tea.Batch(textAreaCmd, viewPortChatCmd, viewPortUsersCmd, viewPortFilesCmd)
+}
+
+func toggleSelected(item list.Item, clientUsername string) (list.Item, string) {
+	if usr, ok := item.(user); ok {
+		if usr.name == clientUsername {
+			return item, ""
+		}
+		if usr.selected == false {
+			usr.selected = true
+			return usr, usr.name
+		}
+		usr.selected = false
+		return usr, ""
+	}
+	return item, ""
 }
 
 func (m ChatModel) View() string {
@@ -267,6 +324,7 @@ func (m ChatModel) View() string {
 
 	chat := styles.FullChatViewStyle.Render(
 		m.viewportChat.View() + gap +
+			styles.SenderStyle.Render(m.targetMsg) + "\n" +
 			m.textarea.View())
 
 	switch m.openedViewports {
@@ -328,15 +386,29 @@ func waitForActivity(recv <-chan protocol.MessageCommunication) tea.Cmd {
 		select {
 		case msg := <-recv:
 			switch msg.TypeMessage {
-			case "List":
+			case "list":
 				users := strings.Split(msg.Content, ",")
-				return listUpdate{users: users}
-			case "Msg":
+				listUsers := make([]list.Item, 0)
+				for _, usr := range users {
+					listUsers = append(listUsers, user{
+						name:     usr,
+						selected: false,
+					})
+				}
+				return listUpdate{users: listUsers}
+			case "msg":
 				return messageStruct{
 					message: msg.Content,
 					user:    msg.User,
 				}
-			case "File":
+			case "privmsg":
+				users := strings.SplitN(msg.User, "|", 2)
+				return privateMessage{
+					orgn:    users[0],
+					dest:    users[1],
+					message: msg.Content,
+				}
+			case "file":
 				metadata := strings.Split(msg.Content, ",")
 				sizeFile, _ := strconv.ParseFloat(metadata[1], 32)
 				return fileStruct{
@@ -346,7 +418,7 @@ func waitForActivity(recv <-chan protocol.MessageCommunication) tea.Cmd {
 					idFile:   msg.IdOptional,
 					percent:  0,
 				}
-			case "Error":
+			case "error":
 				return ErrorMsg{msg: errors.New(msg.Content)}
 			default:
 				return struct{}{}
@@ -368,6 +440,14 @@ func (m ChatModel) sendMessage(message string) {
 	m.send <- protocol.MessageCommunication{
 		TypeMessage: "msg",
 		User:        m.username,
+		Content:     message,
+	}
+}
+
+func (m ChatModel) sendPrivateMessage(message string, destUser string) {
+	m.send <- protocol.MessageCommunication{
+		TypeMessage: "privmsg",
+		User:        m.username + "|" + destUser,
 		Content:     message,
 	}
 }
